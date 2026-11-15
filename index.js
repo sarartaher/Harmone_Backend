@@ -253,17 +253,17 @@ app.get("/events/recent", async (req, res) => {
   }
 });
 
-// Get managed events (events created by a specific user)
+// Get all events (for manage events page), optionally filter by category
 app.get("/account/events", async (req, res) => {
   try {
-    const { email } = req.query;
+    const { category } = req.query;
 
-    if (!email) {
-      return res.status(400).send({ message: "Email is required" });
-    }
+    const filter = category && category !== "all"
+      ? { eventType: category }
+      : {};
 
     const events = await eventCollection
-      .find({ createdByEmail: email })
+      .find(filter)
       .sort({ eventDate: 1 })
       .toArray();
 
@@ -276,19 +276,28 @@ app.get("/account/events", async (req, res) => {
   }
 });
 
-// Update event status
-app.patch("/account/events/:id", async (req, res) => {
+// Update event (full update or status only, supports file upload)
+app.patch("/account/events/:id", upload.single("thumbnail"), async (req, res) => {
   try {
     const { id } = req.params;
-    const { status } = req.body;
+    const updates = { ...req.body };
 
-    if (!status || !["published", "draft"].includes(status)) {
-      return res.status(400).send({ message: "Invalid status" });
+    // Convert eventDate to Date if provided
+    if (updates.eventDate) {
+      updates.eventDate = new Date(updates.eventDate);
     }
+
+    // If a file was uploaded, store the URL path
+    if (req.file) {
+      updates.thumbnail = `http://localhost:${PORT}/uploads/${req.file.filename}`;
+    }
+
+    // Remove _id from updates to avoid immutable field error
+    delete updates._id;
 
     const result = await eventCollection.updateOne(
       { _id: new ObjectId(id) },
-      { $set: { status } }
+      { $set: updates }
     );
 
     if (result.matchedCount === 0) {
