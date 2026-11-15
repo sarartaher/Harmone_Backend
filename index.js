@@ -324,3 +324,9 @@ app.delete("/account/events/:id", async (req, res) => {
     });
   }
 });
+
+app.listen(PORT, () => {
+  console.log({
+    message: `Server is running on ${PORT}`,
+  });
+});
