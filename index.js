@@ -1,17 +1,34 @@
 import express from "express";
-import { MongoClient, ObjectId } from "mongodb";
+import { ObjectId } from "mongodb";
 import cors from "cors";
 import dotenv from "dotenv";
 import multer from "multer";
 import path from "path";
 import { fileURLToPath } from "url";
 import fs from "fs";
+import { requireAuth, requireOwnership } from "./auth-middleware.js";
+import {
+  eventCollection,
+  joinedEventsCollection,
+  userCollection,
+} from "./db.js";
 
 dotenv.config();
 const PORT = process.env.PORT;
+// Base URL used when building absolute links (thumbnails). Change this in
+// production .env instead of editing code.
+const BASE_URL = process.env.BACKEND_URL || `http://localhost:${PORT}`;
 const app = express();
 app.use(express.json());
-app.use(cors());
+// Allow the deployed frontend origin (or any origin in dev) to call the API.
+const allowedFrontend = process.env.FRONTEND_URL;
+app.use(
+  cors(
+    allowedFrontend
+      ? { origin: [allowedFrontend], credentials: true }
+      : { origin: true, credentials: true },
+  ),
+);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -46,32 +63,11 @@ const upload = multer({
   },
 });
 
-const client = new MongoClient(process.env.MONGO_URI);
-
-export async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("You successfully connected to MongoDB!");
-    return client;
-  } catch (err) {
-    console.dir(err);
-    throw err;
-  }
-}
-const mongoClient = await connectToMongoDB();
-const db = mongoClient.db(process.env.DB_NAME);
-const eventCollection = db.collection("events");
-const joinedEventsCollection = db.collection("joinedEvents");
-
-// Join an event (record the join)
-app.post("/events/:id/join", async (req, res) => {
+// Join an event (protected: requires auth)
+app.post("/events/:id/join", requireAuth, async (req, res) => {
   try {
     const { id } = req.params;
-    const { email } = req.body;
-
-    if (!email) {
-      return res.status(400).send({ message: "Email is required" });
-    }
+    const email = req.user.email;
 
     // Check if already joined
     const existing = await joinedEventsCollection.findOne({
@@ -99,14 +95,10 @@ app.post("/events/:id/join", async (req, res) => {
   }
 });
 
-// Get joined events for a user
-app.get("/account/joined", async (req, res) => {
+// Get joined events for authenticated user (protected)
+app.get("/account/joined", requireAuth, async (req, res) => {
   try {
-    const { email } = req.query;
-
-    if (!email) {
-      return res.status(400).send({ message: "Email is required" });
-    }
+    const email = req.user.email;
 
     const joins = await joinedEventsCollection.find({ email }).toArray();
     const eventIds = joins
@@ -138,37 +130,41 @@ app.get("/account/joined", async (req, res) => {
   }
 });
 
-// Create event with file upload support
-app.post("/events", upload.single("thumbnail"), async (req, res) => {
-  try {
-    const body = {
-      ...req.body,
-      eventDate: new Date(req.body.eventDate),
-    };
+// Create event with file upload support (protected: requires auth)
+app.post(
+  "/events",
+  requireAuth,
+  upload.single("thumbnail"),
+  async (req, res) => {
+    try {
+      const body = {
+        ...req.body,
+        eventDate: new Date(req.body.eventDate),
+        createdByEmail: req.user.email,
+      };
 
-    // If a file was uploaded, store the URL path
-    if (req.file) {
-      body.thumbnail = `/uploads/${req.file.filename}`;
+      // If a file was uploaded, store the URL path
+      if (req.file) {
+        body.thumbnail = `/uploads/${req.file.filename}`;
+      }
+
+      const result = await eventCollection.insertOne(body);
+
+      res.send({
+        message: "Event created successfully",
+        insertedId: result.insertedId,
+        thumbnail: body.thumbnail ? `${BASE_URL}${body.thumbnail}` : null,
+      });
+    } catch (error) {
+      console.error("Error inserting event:", error);
+
+      res.status(500).send({
+        message: "Something went wrong",
+        error: error.message,
+      });
     }
-
-    const result = await eventCollection.insertOne(body);
-
-    res.send({
-      message: "Event created successfully",
-      insertedId: result.insertedId,
-      thumbnail: body.thumbnail
-        ? `http://localhost:${PORT}${body.thumbnail}`
-        : null,
-    });
-  } catch (error) {
-    console.error("Error inserting event:", error);
-
-    res.status(500).send({
-      message: "Something went wrong",
-      error: error.message,
-    });
-  }
-});
+  },
+);
 
 // Bulk insert (JSON only, no file upload)
 app.post("/events/bulk", async (req, res) => {
@@ -204,7 +200,7 @@ app.get("/events", async (req, res) => {
       .toArray();
 
     // Prepend base URL to thumbnail paths
-    const baseUrl = `http://localhost:${PORT}`;
+    const baseUrl = BASE_URL;
     const eventsWithUrls = events.map((event) => ({
       ...event,
       thumbnail: event.thumbnail
@@ -234,7 +230,7 @@ app.get("/events/recent", async (req, res) => {
       .toArray();
 
     // Prepend base URL to thumbnail paths
-    const baseUrl = `http://localhost:${PORT}`;
+    const baseUrl = BASE_URL;
     const eventsWithUrls = events.map((event) => ({
       ...event,
       thumbnail: event.thumbnail
@@ -258,9 +254,8 @@ app.get("/account/events", async (req, res) => {
   try {
     const { category } = req.query;
 
-    const filter = category && category !== "all"
-      ? { eventType: category }
-      : {};
+    const filter =
+      category && category !== "all" ? { eventType: category } : {};
 
     const events = await eventCollection
       .find(filter)
@@ -276,61 +271,108 @@ app.get("/account/events", async (req, res) => {
   }
 });
 
-// Update event (full update or status only, supports file upload)
-app.patch("/account/events/:id", upload.single("thumbnail"), async (req, res) => {
+// Update event (full update or status only, supports file upload, protected + ownership)
+app.patch(
+  "/account/events/:id",
+  requireAuth,
+  requireOwnership,
+  upload.single("thumbnail"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const updates = { ...req.body };
+
+      // Convert eventDate to Date if provided
+      if (updates.eventDate) {
+        updates.eventDate = new Date(updates.eventDate);
+      }
+
+      // If a file was uploaded, store the URL path
+      if (req.file) {
+        updates.thumbnail = `${BASE_URL}/uploads/${req.file.filename}`;
+      }
+
+      // Remove _id from updates to avoid immutable field error
+      delete updates._id;
+
+      const result = await eventCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: updates },
+      );
+
+      if (result.matchedCount === 0) {
+        return res.status(404).send({ message: "Event not found" });
+      }
+
+      res.send({ message: "Event updated successfully" });
+    } catch (error) {
+      console.error("Error updating event:", error);
+      res.status(500).send({
+        message: "Failed to update event",
+        error: error.message,
+      });
+    }
+  },
+);
+
+// Delete an event (protected + ownership)
+app.delete(
+  "/account/events/:id",
+  requireAuth,
+  requireOwnership,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const result = await eventCollection.deleteOne({ _id: new ObjectId(id) });
+
+      if (result.deletedCount === 0) {
+        return res.status(404).send({ message: "Event not found" });
+      }
+
+      res.send({ message: "Event deleted successfully" });
+    } catch (error) {
+      console.error("Error deleting event:", error);
+      res.status(500).send({
+        message: "Failed to delete event",
+        error: error.message,
+      });
+    }
+  },
+);
+
+// Get profile for authenticated user
+app.get("/account/profile", requireAuth, async (req, res) => {
   try {
-    const { id } = req.params;
-    const updates = { ...req.body };
-
-    // Convert eventDate to Date if provided
-    if (updates.eventDate) {
-      updates.eventDate = new Date(updates.eventDate);
-    }
-
-    // If a file was uploaded, store the URL path
-    if (req.file) {
-      updates.thumbnail = `http://localhost:${PORT}/uploads/${req.file.filename}`;
-    }
-
-    // Remove _id from updates to avoid immutable field error
-    delete updates._id;
-
-    const result = await eventCollection.updateOne(
-      { _id: new ObjectId(id) },
-      { $set: updates }
-    );
-
-    if (result.matchedCount === 0) {
-      return res.status(404).send({ message: "Event not found" });
-    }
-
-    res.send({ message: "Event updated successfully" });
-  } catch (error) {
-    console.error("Error updating event:", error);
-    res.status(500).send({
-      message: "Failed to update event",
-      error: error.message,
+    const user = await userCollection.findOne({
+      _id: new ObjectId(req.user.id),
     });
+    res.send({
+      name: user?.name,
+      email: user?.email,
+      createdAt: user?.createdAt,
+      updatedAt: user?.updatedAt,
+    });
+  } catch (error) {
+    console.error("Error fetching profile:", error);
+    res.status(500).send({ message: "Failed to load profile" });
   }
 });
 
-// Delete an event
-app.delete("/account/events/:id", async (req, res) => {
+// Update profile (name only)
+app.patch("/account/profile", requireAuth, async (req, res) => {
   try {
-    const { id } = req.params;
-    const result = await eventCollection.deleteOne({ _id: new ObjectId(id) });
-
-    if (result.deletedCount === 0) {
-      return res.status(404).send({ message: "Event not found" });
+    const { name } = req.body;
+    if (!name || name.trim() === "") {
+      return res.status(400).send({ message: "Name is required" });
     }
-
-    res.send({ message: "Event deleted successfully" });
+    await userCollection.updateOne(
+      { _id: new ObjectId(req.user.id) },
+      { $set: { name } },
+    );
+    res.send({ message: "Profile updated successfully" });
   } catch (error) {
-    console.error("Error deleting event:", error);
-    res.status(500).send({
-      message: "Failed to delete event",
-      error: error.message,
-    });
+    console.error("Error updating profile:", error);
+    res.status(500).send({ message: "Failed to update profile" });
   }
 });
 
