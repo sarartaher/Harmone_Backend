@@ -381,3 +381,5 @@ app.listen(PORT, () => {
     message: `Server is running on ${PORT}`,
   });
 });
+
+export default app;
